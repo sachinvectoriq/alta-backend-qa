@@ -1,0 +1,21 @@
+{
+    "sp": {
+        "entityId": "your-sp-entity-id",
+        "assertionConsumerService": {
+            "url": "http://localhost:5000/saml/callback"
+        },
+        "singleLogoutService": {
+            "url": "http://localhost:5000/saml/logout"
+        }
+    },
+    "idp": {
+        "entityId": "your-idp-entity-id",
+        "singleSignOnService": {
+            "url": "https://your-idp-sso-url"
+        },
+        "singleLogoutService": {
+            "url": "https://your-idp-slo-url"
+        },
+        "x509cert": "your-idp-certificate"
+    }
+}
