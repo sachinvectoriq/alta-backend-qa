@@ -8,7 +8,7 @@ import threading
 import time
 from dataclasses import dataclass
 from queue import Queue, Empty
-
+from collections import defaultdict
 from requests.adapters import HTTPAdapter
 from psycopg2.pool import ThreadedConnectionPool
 
@@ -37,13 +37,8 @@ port = os.getenv("DB_PORT")
 
 ADMIN_ID = "1"
 
-DB_POOL_MIN = int(
-    os.getenv("DB_POOL_MIN", "2")
-)
-
-DB_POOL_MAX = int(
-    os.getenv("DB_POOL_MAX", "20")
-)
+DB_POOL_MIN = int(os.getenv("DB_POOL_MIN", "2"))
+DB_POOL_MAX = int(os.getenv("DB_POOL_MAX", "20"))
 
 
 # ============================================================
@@ -65,6 +60,91 @@ HTTP_READ_TIMEOUT = float(
 HTTP_TIMEOUT = (
     HTTP_CONNECT_TIMEOUT,
     HTTP_READ_TIMEOUT
+)
+
+
+# ============================================================
+# BATCH CONFIGURATION
+# ============================================================
+
+# Existing requests remain single-request unless explicitly:
+#
+#     "batch": true
+#
+BATCH_ENABLED_DEFAULT = False
+
+
+# Safe batch size.
+#
+# Azure Translator supports multiple texts in one request.
+# We intentionally stay below the maximum to leave safety margin.
+BATCH_MAX_ITEMS = int(
+    os.getenv(
+        "TRANSLATOR_BATCH_MAX_ITEMS",
+        "50"
+    )
+)
+
+
+# Keep character count comfortably below the downstream limit.
+BATCH_MAX_CHARACTERS = int(
+    os.getenv(
+        "TRANSLATOR_BATCH_MAX_CHARACTERS",
+        "40000"
+    )
+)
+
+
+# Maximum time the collector waits for additional compatible
+# requests before flushing the current batch.
+BATCH_MAX_WAIT_SECONDS = float(
+    os.getenv(
+        "TRANSLATOR_BATCH_MAX_WAIT_SECONDS",
+        "0.05"
+    )
+)
+
+
+# Number of Azure Translator requests allowed simultaneously.
+#
+# IMPORTANT:
+# This is deliberately controlled instead of allowing every
+# incoming HTTP request to independently hit Translator.
+BATCH_DISPATCH_CONCURRENCY = int(
+    os.getenv(
+        "TRANSLATOR_BATCH_DISPATCH_CONCURRENCY",
+        "2"
+    )
+)
+
+
+# Number of retries specifically for Azure 429.
+BATCH_429_RETRIES = int(
+    os.getenv(
+        "TRANSLATOR_429_RETRIES",
+        "5"
+    )
+)
+
+
+# Base backoff when Azure returns 429 and no Retry-After is supplied.
+BATCH_429_BACKOFF_SECONDS = float(
+    os.getenv(
+        "TRANSLATOR_429_BACKOFF_SECONDS",
+        "1.0"
+    )
+)
+
+
+# Maximum time an individual incoming request is allowed to wait
+# for the batch operation.
+#
+# Keep this higher than the load-test timeout if possible.
+BATCH_REQUEST_TIMEOUT = float(
+    os.getenv(
+        "TRANSLATOR_BATCH_REQUEST_TIMEOUT",
+        "120"
+    )
 )
 
 
@@ -154,7 +234,7 @@ def fetch_settings(admin_id):
     global _settings_cache
 
     # --------------------------------------------------------
-    # FIRST: use cached settings
+    # FAST PATH
     # --------------------------------------------------------
 
     with _settings_lock:
@@ -163,8 +243,7 @@ def fetch_settings(admin_id):
             return _settings_cache
 
     # --------------------------------------------------------
-    # CACHE EMPTY:
-    # fall back to database
+    # CACHE EMPTY
     # --------------------------------------------------------
 
     if db_pool is None:
@@ -202,7 +281,7 @@ def fetch_settings(admin_id):
             return None
 
         # ----------------------------------------------------
-        # Cache settings for future requests
+        # CACHE
         # ----------------------------------------------------
 
         with _settings_lock:
@@ -246,8 +325,9 @@ def fetch_settings(admin_id):
 # ============================================================
 
 _language_cache = {}
-
 _language_cache_lock = threading.RLock()
+
+_language_refresh_lock = threading.Lock()
 
 
 def get_supported_languages(
@@ -343,16 +423,6 @@ def get_language_code(
     api_key=None
 ):
 
-    """
-    Resolve language name to Azure language code.
-
-    Normal path:
-        memory cache -> immediate lookup
-
-    Fallback path:
-        cache miss -> refresh supported languages -> retry
-    """
-
     if not language_name:
         return None
 
@@ -361,7 +431,7 @@ def get_language_code(
     )
 
     # --------------------------------------------------------
-    # 1. FAST PATH
+    # FAST CACHE LOOKUP
     # --------------------------------------------------------
 
     with _language_cache_lock:
@@ -374,7 +444,7 @@ def get_language_code(
         return cached_code
 
     # --------------------------------------------------------
-    # 2. CACHE MISS
+    # CACHE MISS
     # --------------------------------------------------------
 
     if not endpoint or not api_key:
@@ -387,123 +457,147 @@ def get_language_code(
 
         return None
 
-    try:
+    # Prevent 1000 simultaneous requests from all trying
+    # to refresh /languages at the same time.
+    with _language_refresh_lock:
 
-        logging.warning(
-            "Language cache miss for '%s'. "
-            "Refreshing supported languages.",
-            language_name
-        )
-
-        supported_languages = (
-            get_supported_languages(
-                endpoint,
-                api_key
-            )
-        )
-
-        build_language_cache(
-            supported_languages
-        )
-
-        # ----------------------------------------------------
-        # 3. RETRY FROM REFRESHED CACHE
-        # ----------------------------------------------------
-
+        # Another request may have populated it while
+        # this request was waiting for the lock.
         with _language_cache_lock:
 
-            return _language_cache.get(
+            cached_code = _language_cache.get(
                 normalized_name
             )
 
-    except Exception:
+        if cached_code:
+            return cached_code
 
-        logging.exception(
-            "Failed to refresh language cache "
-            "for language '%s'.",
-            language_name
-        )
+        try:
 
-        return None
+            logging.info(
+                "Refreshing language cache for '%s'.",
+                language_name
+            )
+
+            supported_languages = (
+                get_supported_languages(
+                    endpoint,
+                    api_key
+                )
+            )
+
+            build_language_cache(
+                supported_languages
+            )
+
+            with _language_cache_lock:
+
+                return _language_cache.get(
+                    normalized_name
+                )
+
+        except Exception:
+
+            logging.exception(
+                "Failed to refresh language cache "
+                "for language '%s'.",
+                language_name
+            )
+
+            return None
 
 
 # ============================================================
-# BATCH TRANSLATION
-#
-# OPT-IN ONLY
-#
-# Normal requests are NOT affected.
-#
-# Request:
-# {
-#     "text": "...",
-#     "source_language": "English",
-#     "target_language": "French",
-#     "batch": true
-# }
-#
+# BATCH REQUEST OBJECT
 # ============================================================
-
-BATCH_ENABLED_DEFAULT = False
-
-BATCH_MAX_ITEMS = int(
-    os.getenv(
-        "TRANSLATOR_BATCH_MAX_ITEMS",
-        "60"
-    )
-)
-
-BATCH_MAX_CHARACTERS = int(
-    os.getenv(
-        "TRANSLATOR_BATCH_MAX_CHARACTERS",
-        "45000"
-    )
-)
-
-BATCH_MAX_WAIT_SECONDS = float(
-    os.getenv(
-        "TRANSLATOR_BATCH_MAX_WAIT_SECONDS",
-        "0.10"
-    )
-)
-
 
 @dataclass
 class BatchRequest:
 
     text: str
+
     source_language_code: str | None
+
     target_language_code: str
 
     event: threading.Event
 
     result: object = None
+
     error_status: int | None = None
+
     error_body: object = None
+
     request_id: str | None = None
 
+
+# ============================================================
+# TRANSLATION BATCHER
+# ============================================================
 
 class TranslationBatcher:
 
     def __init__(self):
 
-        self.queue = Queue()
+        # ----------------------------------------------------
+        # Incoming requests
+        # ----------------------------------------------------
 
-        self.worker = threading.Thread(
-            target=self._worker_loop,
+        self.input_queue = Queue()
+
+        # ----------------------------------------------------
+        # Batches waiting to be sent to Azure
+        # ----------------------------------------------------
+
+        self.batch_queue = Queue()
+
+        # ----------------------------------------------------
+        # Collector
+        # ----------------------------------------------------
+
+        self.collector = threading.Thread(
+            target=self._collector_loop,
             daemon=True,
-            name="translator-batch-worker"
+            name="translator-batch-collector"
         )
 
-        self.worker.start()
+        self.collector.start()
+
+        # ----------------------------------------------------
+        # Azure dispatch workers
+        # ----------------------------------------------------
+
+        self.dispatchers = []
+
+        for index in range(
+            BATCH_DISPATCH_CONCURRENCY
+        ):
+
+            worker = threading.Thread(
+                target=self._dispatcher_loop,
+                daemon=True,
+                name=f"translator-batch-dispatcher-{index + 1}"
+            )
+
+            worker.start()
+
+            self.dispatchers.append(
+                worker
+            )
 
         logging.info(
-            "Translator batch worker started. "
-            "max_items=%s max_characters=%s max_wait=%ss",
+            "Translator batch system started. "
+            "max_items=%s max_chars=%s max_wait=%ss "
+            "dispatch_concurrency=%s",
             BATCH_MAX_ITEMS,
             BATCH_MAX_CHARACTERS,
-            BATCH_MAX_WAIT_SECONDS
+            BATCH_MAX_WAIT_SECONDS,
+            BATCH_DISPATCH_CONCURRENCY
         )
+
+    # ========================================================
+    # SUBMIT
+    # ========================================================
 
     def submit(
         self,
@@ -519,17 +613,25 @@ class TranslationBatcher:
             event=threading.Event()
         )
 
-        self.queue.put(item)
+        self.input_queue.put(
+            item
+        )
 
         return item
 
-    def _worker_loop(self):
+    # ========================================================
+    # COLLECTOR
+    # ========================================================
+
+    def _collector_loop(self):
 
         while True:
 
             try:
 
-                first_item = self.queue.get()
+                first_item = (
+                    self.input_queue.get()
+                )
 
                 batch = [
                     first_item
@@ -542,12 +644,20 @@ class TranslationBatcher:
                 batch_start = time.monotonic()
 
                 # ------------------------------------------------
-                # Collect compatible requests
+                # Collect compatible requests.
+                #
+                # We stop when:
+                #
+                # 1. max items reached
+                # 2. max characters reached
+                # 3. max wait reached
                 # ------------------------------------------------
 
                 while (
-                    len(batch) < BATCH_MAX_ITEMS
-                    and total_characters < BATCH_MAX_CHARACTERS
+                    len(batch)
+                    < BATCH_MAX_ITEMS
+                    and total_characters
+                    < BATCH_MAX_CHARACTERS
                 ):
 
                     remaining_wait = (
@@ -563,40 +673,40 @@ class TranslationBatcher:
 
                     try:
 
-                        candidate = self.queue.get(
-                            timeout=remaining_wait
+                        candidate = (
+                            self.input_queue.get(
+                                timeout=remaining_wait
+                            )
                         )
 
                     except Empty:
 
                         break
 
-                    # ------------------------------------------------
-                    # IMPORTANT:
-                    #
-                    # Requests with different source/target languages
-                    # cannot be placed in the same Translator request.
-                    # ------------------------------------------------
-
                     same_source = (
                         candidate.source_language_code
-                        == first_item.source_language_code
+                        ==
+                        first_item.source_language_code
                     )
 
                     same_target = (
                         candidate.target_language_code
-                        == first_item.target_language_code
+                        ==
+                        first_item.target_language_code
                     )
 
                     candidate_size = len(
                         candidate.text
                     )
 
+                    # ------------------------------------------------
+                    # Add compatible item.
+                    # ------------------------------------------------
+
                     if (
                         same_source
                         and same_target
-                        and
-                        (
+                        and (
                             total_characters
                             + candidate_size
                             <= BATCH_MAX_CHARACTERS
@@ -613,21 +723,55 @@ class TranslationBatcher:
 
                     else:
 
-                        # ------------------------------------------------
-                        # Not compatible with this batch.
+                        # Different language pair.
                         #
-                        # Put it back so another batch can process it.
-                        # ------------------------------------------------
-
-                        self.queue.put(
+                        # Put it back into the queue.
+                        self.input_queue.put(
                             candidate
                         )
 
                         break
 
                 # ------------------------------------------------
-                # Send batch
+                # Put completed batch into dispatcher queue.
+                #
+                # IMPORTANT:
+                # The collector does NOT call Azure.
+                # This prevents incoming HTTP traffic from
+                # directly controlling Azure concurrency.
                 # ------------------------------------------------
+
+                self.batch_queue.put(
+                    batch
+                )
+
+                logging.info(
+                    "BATCH CREATED | "
+                    "Items=%s | "
+                    "Characters=%s | "
+                    "QueueDepth=%s",
+                    len(batch),
+                    total_characters,
+                    self.batch_queue.qsize()
+                )
+
+            except Exception:
+
+                logging.exception(
+                    "Unexpected error in batch collector."
+                )
+
+    # ========================================================
+    # DISPATCHER
+    # ========================================================
+
+    def _dispatcher_loop(self):
+
+        while True:
+
+            try:
+
+                batch = self.batch_queue.get()
 
                 self._process_batch(
                     batch
@@ -636,9 +780,12 @@ class TranslationBatcher:
             except Exception:
 
                 logging.exception(
-                    "Unexpected error in batch worker."
+                    "Unexpected error in batch dispatcher."
                 )
 
+    # ========================================================
+    # PROCESS BATCH
+    # ========================================================
 
     def _process_batch(
         self,
@@ -657,7 +804,7 @@ class TranslationBatcher:
         try:
 
             # ----------------------------------------------------
-            # Settings are already cached by the API layer.
+            # Settings are cached.
             # ----------------------------------------------------
 
             settings = fetch_settings(
@@ -671,25 +818,30 @@ class TranslationBatcher:
 
                 error_body = {
                     "error": (
-                        "Failed to retrieve all required "
-                        "settings."
-                    )
+                        "Translation service "
+                        "configuration is temporarily "
+                        "unavailable."
+                    ),
+                    "request_id": request_id
                 }
 
                 for item in batch:
 
-                    item.error_status = 500
-                    item.error_body = error_body
-                    item.request_id = request_id
+                    item.error_status = 503
+
+                    item.error_body = (
+                        error_body
+                    )
+
+                    item.request_id = (
+                        request_id
+                    )
+
                     item.event.set()
 
                 return
 
             key, endpoint, region = settings
-
-            # ----------------------------------------------------
-            # Translator endpoint
-            # ----------------------------------------------------
 
             constructed_url = (
                 f"{endpoint.rstrip('/')}"
@@ -716,20 +868,6 @@ class TranslationBatcher:
                 "X-ClientTraceId": request_id
             }
 
-            # ----------------------------------------------------
-            # THIS IS THE MAIN BATCH OPTIMIZATION
-            #
-            # Instead of:
-            #
-            #   POST -> one text
-            #   POST -> one text
-            #   POST -> one text
-            #
-            # We send:
-            #
-            #   POST -> [text1, text2, text3, ...]
-            # ----------------------------------------------------
-
             body = [
                 {
                     "text": item.text
@@ -737,42 +875,157 @@ class TranslationBatcher:
                 for item in batch
             ]
 
-            logging.info(
-                "TRANSLATOR BATCH | "
-                "BatchSize=%s | "
-                "Characters=%s | "
-                "Source=%s | "
-                "Target=%s | "
-                "RequestID=%s",
-                len(batch),
-                sum(len(item.text) for item in batch),
-                first.source_language_code,
-                first.target_language_code,
-                request_id
-            )
-
-            response = http_session.post(
-                constructed_url,
-                params=params,
-                headers=headers,
-                json=body,
-                timeout=HTTP_TIMEOUT
+            total_characters = sum(
+                len(item.text)
+                for item in batch
             )
 
             # ----------------------------------------------------
-            # EXACT AZURE ERROR
+            # SEND WITH 429 RETRY/BACKOFF
             # ----------------------------------------------------
+
+            response = None
+
+            for attempt in range(
+                BATCH_429_RETRIES + 1
+            ):
+
+                logging.info(
+                    "TRANSLATOR BATCH SEND | "
+                    "RequestID=%s | "
+                    "BatchSize=%s | "
+                    "Characters=%s | "
+                    "Attempt=%s",
+                    request_id,
+                    len(batch),
+                    total_characters,
+                    attempt + 1
+                )
+
+                try:
+
+                    response = (
+                        http_session.post(
+                            constructed_url,
+                            params=params,
+                            headers=headers,
+                            json=body,
+                            timeout=HTTP_TIMEOUT
+                        )
+                    )
+
+                except requests.exceptions.Timeout:
+
+                    if attempt < BATCH_429_RETRIES:
+
+                        backoff = (
+                            BATCH_429_BACKOFF_SECONDS
+                            * (2 ** attempt)
+                        )
+
+                        logging.warning(
+                            "TRANSLATOR TIMEOUT | "
+                            "RequestID=%s | "
+                            "retrying in %.2fs",
+                            request_id,
+                            backoff
+                        )
+
+                        time.sleep(
+                            backoff
+                        )
+
+                        continue
+
+                    raise
+
+                # ------------------------------------------------
+                # SUCCESS
+                # ------------------------------------------------
+
+                if response.status_code == 200:
+                    break
+
+                # ------------------------------------------------
+                # AZURE RATE LIMIT
+                # ------------------------------------------------
+
+                if response.status_code == 429:
+
+                    if attempt >= BATCH_429_RETRIES:
+                        break
+
+                    retry_after = (
+                        response.headers.get(
+                            "Retry-After"
+                        )
+                    )
+
+                    if retry_after:
+
+                        try:
+                            backoff = float(
+                                retry_after
+                            )
+                        except ValueError:
+                            backoff = (
+                                BATCH_429_BACKOFF_SECONDS
+                                * (2 ** attempt)
+                            )
+
+                    else:
+
+                        backoff = (
+                            BATCH_429_BACKOFF_SECONDS
+                            * (2 ** attempt)
+                        )
+
+                    logging.warning(
+                        "AZURE 429 | "
+                        "RequestID=%s | "
+                        "BatchSize=%s | "
+                        "Attempt=%s | "
+                        "RetryingIn=%.2fs | "
+                        "AzureResponse=%s",
+                        request_id,
+                        len(batch),
+                        attempt + 1,
+                        backoff,
+                        response.text[:1000]
+                    )
+
+                    time.sleep(
+                        backoff
+                    )
+
+                    continue
+
+                # ------------------------------------------------
+                # Other HTTP errors.
+                #
+                # Do NOT retry blindly.
+                # ------------------------------------------------
+
+                break
+
+            # ====================================================
+            # DOWNSTREAM FAILURE
+            # ====================================================
+
+            if response is None:
+
+                raise RuntimeError(
+                    "No response received from Translator."
+                )
 
             if not response.ok:
 
                 logging.error(
-                    (
-                        "TRANSLATOR BATCH FAILURE | "
-                        "RequestID=%s | "
-                        "BatchSize=%s | "
-                        "HTTPStatus=%s | "
-                        "Response=%s"
-                    ),
+                    "TRANSLATOR BATCH FAILURE | "
+                    "RequestID=%s | "
+                    "BatchSize=%s | "
+                    "HTTPStatus=%s | "
+                    "Response=%s",
                     request_id,
                     len(batch),
                     response.status_code,
@@ -781,13 +1034,29 @@ class TranslationBatcher:
 
                 try:
 
-                    error_body = response.json()
+                    downstream_body = (
+                        response.json()
+                    )
 
                 except ValueError:
 
-                    error_body = {
-                        "message": response.text[:4000]
+                    downstream_body = {
+                        "message":
+                            response.text[:4000]
                     }
+
+                error_body = {
+                    "error": (
+                        "Azure Translator "
+                        "request failed."
+                    ),
+                    "downstream_status":
+                        response.status_code,
+                    "downstream_response":
+                        downstream_body,
+                    "request_id":
+                        request_id
+                }
 
                 for item in batch:
 
@@ -795,42 +1064,40 @@ class TranslationBatcher:
                         response.status_code
                     )
 
-                    item.error_body = {
-                        "error": (
-                            "Azure Translator batch "
-                            "request failed."
-                        ),
-                        "downstream_status": (
-                            response.status_code
-                        ),
-                        "downstream_response": (
-                            error_body
-                        ),
-                        "request_id": request_id
-                    }
+                    item.error_body = (
+                        error_body
+                    )
 
-                    item.request_id = request_id
+                    item.request_id = (
+                        request_id
+                    )
 
                     item.event.set()
 
                 return
 
-            # ----------------------------------------------------
-            # SUCCESS
-            # ----------------------------------------------------
+            # ====================================================
+            # PARSE SUCCESS
+            # ====================================================
 
             response_json = response.json()
 
-            # Azure returns translations in the same order
-            # as the input array.
             if (
-                not isinstance(response_json, list)
-                or len(response_json) != len(batch)
+                not isinstance(
+                    response_json,
+                    list
+                )
+                or
+                len(response_json)
+                != len(batch)
             ):
 
                 logging.error(
-                    "Unexpected Translator batch response. "
-                    "Expected %s results, received %s.",
+                    "Unexpected Translator batch response | "
+                    "RequestID=%s | "
+                    "Expected=%s | "
+                    "Received=%s",
+                    request_id,
                     len(batch),
                     (
                         len(response_json)
@@ -844,125 +1111,166 @@ class TranslationBatcher:
 
                 error_body = {
                     "error": (
-                        "Unexpected response received "
-                        "from Azure Translator."
+                        "Unexpected response "
+                        "received from Azure "
+                        "Translator."
                     ),
-                    "request_id": request_id
+                    "request_id":
+                        request_id
                 }
 
                 for item in batch:
 
                     item.error_status = 502
-                    item.error_body = error_body
-                    item.request_id = request_id
+
+                    item.error_body = (
+                        error_body
+                    )
+
+                    item.request_id = (
+                        request_id
+                    )
+
                     item.event.set()
 
                 return
 
-            # ----------------------------------------------------
-            # MAP EACH AZURE RESULT BACK TO ITS ORIGINAL REQUEST
-            # ----------------------------------------------------
+            # ====================================================
+            # MAP RESULTS
+            # ====================================================
 
-            for index, item in enumerate(batch):
+            for index, item in enumerate(
+                batch
+            ):
 
                 item.result = (
                     response_json[index]
                 )
 
-                item.request_id = request_id
+                item.request_id = (
+                    request_id
+                )
 
                 item.event.set()
 
-        except requests.exceptions.Timeout as timeout_err:
-
-            logging.error(
-                (
-                    "TRANSLATOR BATCH TIMEOUT | "
-                    "RequestID=%s | "
-                    "BatchSize=%s | "
-                    "Error=%s"
-                ),
+            logging.info(
+                "TRANSLATOR BATCH SUCCESS | "
+                "RequestID=%s | "
+                "Items=%s | "
+                "Characters=%s",
                 request_id,
                 len(batch),
-                str(timeout_err),
-                exc_info=True
+                total_characters
             )
 
-            for item in batch:
-
-                item.error_status = 504
-
-                item.error_body = {
-                    "error": (
-                        "Translation service "
-                        "request timed out."
-                    ),
-                    "request_id": request_id
-                }
-
-                item.request_id = request_id
-
-                item.event.set()
-
-        except requests.exceptions.RequestException as req_err:
+        except requests.exceptions.Timeout as e:
 
             logging.error(
-                (
-                    "TRANSLATOR BATCH REQUEST ERROR | "
-                    "RequestID=%s | "
-                    "BatchSize=%s | "
-                    "Error=%s"
-                ),
-                request_id,
-                len(batch),
-                str(req_err),
-                exc_info=True
-            )
-
-            for item in batch:
-
-                item.error_status = 500
-
-                item.error_body = {
-                    "error": (
-                        f"Request error occurred: "
-                        f"{req_err}"
-                    ),
-                    "request_id": request_id
-                }
-
-                item.request_id = request_id
-
-                item.event.set()
-
-        except Exception as e:
-
-            logging.error(
-                (
-                    "UNEXPECTED BATCH ERROR | "
-                    "RequestID=%s | "
-                    "BatchSize=%s | "
-                    "Error=%s"
-                ),
+                "TRANSLATOR BATCH TIMEOUT | "
+                "RequestID=%s | "
+                "BatchSize=%s | "
+                "Error=%s",
                 request_id,
                 len(batch),
                 str(e),
                 exc_info=True
             )
 
+            error_body = {
+                "error": (
+                    "Translation service "
+                    "request timed out."
+                ),
+                "request_id":
+                    request_id
+            }
+
+            for item in batch:
+
+                item.error_status = 504
+
+                item.error_body = (
+                    error_body
+                )
+
+                item.request_id = (
+                    request_id
+                )
+
+                item.event.set()
+
+        except requests.exceptions.RequestException as e:
+
+            logging.error(
+                "TRANSLATOR REQUEST ERROR | "
+                "RequestID=%s | "
+                "BatchSize=%s | "
+                "Error=%s",
+                request_id,
+                len(batch),
+                str(e),
+                exc_info=True
+            )
+
+            error_body = {
+                "error": (
+                    "Translator request "
+                    "could not be completed."
+                ),
+                "details": str(e),
+                "request_id":
+                    request_id
+            }
+
+            for item in batch:
+
+                item.error_status = 502
+
+                item.error_body = (
+                    error_body
+                )
+
+                item.request_id = (
+                    request_id
+                )
+
+                item.event.set()
+
+        except Exception as e:
+
+            logging.error(
+                "UNEXPECTED BATCH ERROR | "
+                "RequestID=%s | "
+                "BatchSize=%s | "
+                "Error=%s",
+                request_id,
+                len(batch),
+                str(e),
+                exc_info=True
+            )
+
+            error_body = {
+                "error": (
+                    "An unexpected error "
+                    "occurred while processing "
+                    "the translation."
+                ),
+                "details": str(e),
+                "request_id":
+                    request_id
+            }
+
             for item in batch:
 
                 item.error_status = 500
 
-                item.error_body = {
-                    "error": (
-                        "An unexpected error occurred "
-                        "while processing the translation."
-                    ),
-                    "request_id": request_id
-                }
+                item.error_body = (
+                    error_body
+                )
 
-                item.request_id = request_id
+                item.request_id = (
+                    request_id
+                )
 
                 item.event.set()
 
@@ -984,10 +1292,6 @@ def initialize_application():
 
         initialize_db_pool()
 
-        # ----------------------------------------------------
-        # Load DB settings and cache them
-        # ----------------------------------------------------
-
         settings = fetch_settings(
             ADMIN_ID
         )
@@ -995,7 +1299,8 @@ def initialize_application():
         if settings is None:
 
             logging.warning(
-                "Application started without database settings."
+                "Application started without "
+                "database settings."
             )
 
             return
@@ -1003,7 +1308,7 @@ def initialize_application():
         key, endpoint, region = settings
 
         # ----------------------------------------------------
-        # Load supported languages ONCE
+        # Load language mappings once.
         # ----------------------------------------------------
 
         try:
@@ -1033,7 +1338,8 @@ def initialize_application():
     except Exception:
 
         logging.exception(
-            "Application initialization encountered an error."
+            "Application initialization "
+            "encountered an error."
         )
 
 
@@ -1051,17 +1357,10 @@ def text_trans_azure():
         "Processing translation request."
     )
 
-    # --------------------------------------------------------
-    # Hardcoded Admin ID
-    # --------------------------------------------------------
-
     admin_id = ADMIN_ID
 
     # --------------------------------------------------------
-    # Get settings
-    #
-    # Cached normally.
-    # DB fallback only if cache is empty.
+    # Cached settings.
     # --------------------------------------------------------
 
     result = fetch_settings(
@@ -1070,26 +1369,18 @@ def text_trans_azure():
 
     if result is None or len(result) < 3:
 
-        logging.error(
-            "Failed to retrieve all required settings "
-            "(key, text_translation_endpoint, region)."
-        )
-
         return jsonify({
             "error": (
-                "Failed to retrieve all required settings "
-                "(key, text_translation_endpoint, region)."
+                "Translation service "
+                "configuration is temporarily "
+                "unavailable."
             )
-        }), 500
-
-    # --------------------------------------------------------
-    # Unpack settings
-    # --------------------------------------------------------
+        }), 503
 
     key, text_translation_endpoint, region = result
 
     # --------------------------------------------------------
-    # Request data
+    # Request body
     # --------------------------------------------------------
 
     data = request.get_json(
@@ -1100,8 +1391,8 @@ def text_trans_azure():
 
         return jsonify({
             "error": (
-                "Please pass target_language and text "
-                "in the request."
+                "Please pass target_language "
+                "and text in the request."
             )
         }), 400
 
@@ -1118,14 +1409,7 @@ def text_trans_azure():
     )
 
     # --------------------------------------------------------
-    # NEW:
-    # BATCH FLAG
-    #
-    # If omitted or false:
-    # existing behavior.
-    #
-    # If true:
-    # request enters batch collector.
+    # Batch flag
     # --------------------------------------------------------
 
     batch_requested = data.get(
@@ -1133,30 +1417,29 @@ def text_trans_azure():
         BATCH_ENABLED_DEFAULT
     )
 
-    # Make sure only an explicit true enables batching.
     batch_requested = (
         batch_requested is True
     )
 
     # --------------------------------------------------------
-    # Validate
+    # Validation
     # --------------------------------------------------------
 
-    if not target_language_name or not text_to_translate:
+    if (
+        not target_language_name
+        or not text_to_translate
+    ):
 
         return jsonify({
             "error": (
-                "Please pass target_language and text "
-                "in the request."
+                "Please pass target_language "
+                "and text in the request."
             )
         }), 400
 
-    # --------------------------------------------------------
-    # TARGET LANGUAGE
-    #
-    # Cache first.
-    # /languages fallback only on cache miss.
-    # --------------------------------------------------------
+    # ========================================================
+    # LANGUAGE RESOLUTION
+    # ========================================================
 
     target_language_code = (
         get_language_code(
@@ -1175,10 +1458,6 @@ def text_trans_azure():
                 "is not supported."
             )
         }), 400
-
-    # --------------------------------------------------------
-    # SOURCE LANGUAGE
-    # --------------------------------------------------------
 
     source_language_code = None
 
@@ -1203,43 +1482,72 @@ def text_trans_azure():
             }), 400
 
     # ========================================================
-    # NEW BATCH PATH
-    #
-    # ONLY runs when:
-    #
-    #     "batch": true
-    #
+    # BATCH PATH
     # ========================================================
 
     if batch_requested:
 
         logging.info(
-            "BATCH REQUEST | "
+            "BATCH REQUEST RECEIVED | "
             "Source=%s | "
             "Target=%s | "
-            "Characters=%s",
+            "Characters=%s | "
+            "QueueDepth=%s",
             source_language_code,
             target_language_code,
-            len(text_to_translate)
+            len(text_to_translate),
+            translation_batcher.input_queue.qsize()
         )
 
-        batch_item = translation_batcher.submit(
-            text=text_to_translate,
-            source_language_code=source_language_code,
-            target_language_code=target_language_code
+        batch_item = (
+            translation_batcher.submit(
+                text=text_to_translate,
+                source_language_code=
+                    source_language_code,
+                target_language_code=
+                    target_language_code
+            )
         )
 
         # ----------------------------------------------------
-        # Wait for the batch worker to process this request.
+        # Wait for THIS request's result.
         #
-        # The worker waits up to BATCH_MAX_WAIT_SECONDS
-        # to collect compatible requests.
+        # The request is not calling Azure directly.
+        # The batch worker does it.
         # ----------------------------------------------------
 
-        batch_item.event.wait()
+        completed = (
+            batch_item.event.wait(
+                timeout=BATCH_REQUEST_TIMEOUT
+            )
+        )
+
+        if not completed:
+
+            request_id = str(
+                uuid.uuid4()
+            )
+
+            logging.error(
+                "BATCH REQUEST TIMEOUT | "
+                "RequestID=%s | "
+                "QueueDepth=%s",
+                request_id,
+                translation_batcher.input_queue.qsize()
+            )
+
+            return jsonify({
+                "error": (
+                    "Translation request "
+                    "remained queued beyond "
+                    "the allowed processing time."
+                ),
+                "request_id":
+                    request_id
+            }), 504
 
         # ----------------------------------------------------
-        # Batch failed
+        # Batch failed.
         # ----------------------------------------------------
 
         if batch_item.error_status is not None:
@@ -1249,9 +1557,7 @@ def text_trans_azure():
             ), batch_item.error_status
 
         # ----------------------------------------------------
-        # Batch succeeded
-        #
-        # Return ONLY this request's Azure result.
+        # Return this request's result.
         # ----------------------------------------------------
 
         return jsonify(
@@ -1259,15 +1565,8 @@ def text_trans_azure():
         ), 200
 
     # ========================================================
-    # EXISTING SINGLE-REQUEST PATH
-    #
-    # UNCHANGED.
-    #
+    # EXISTING SINGLE REQUEST PATH
     # ========================================================
-
-    # --------------------------------------------------------
-    # AZURE TRANSLATOR API
-    # --------------------------------------------------------
 
     path = "/translate"
 
@@ -1278,7 +1577,9 @@ def text_trans_azure():
 
     params = {
         "api-version": "3.0",
-        "to": [target_language_code]
+        "to": [
+            target_language_code
+        ]
     }
 
     if source_language_code:
@@ -1306,31 +1607,27 @@ def text_trans_azure():
 
     try:
 
-        # ----------------------------------------------------
-        # Reusable HTTP connection
-        # ----------------------------------------------------
-
-        response = http_session.post(
-            constructed_url,
-            params=params,
-            headers=headers,
-            json=body,
-            timeout=HTTP_TIMEOUT
+        response = (
+            http_session.post(
+                constructed_url,
+                params=params,
+                headers=headers,
+                json=body,
+                timeout=HTTP_TIMEOUT
+            )
         )
 
         # ----------------------------------------------------
-        # DETAILED AZURE ERROR
+        # Return exact downstream status/error.
         # ----------------------------------------------------
 
         if not response.ok:
 
             logging.error(
-                (
-                    "TRANSLATOR FAILURE | "
-                    "RequestID=%s | "
-                    "HTTPStatus=%s | "
-                    "Response=%s"
-                ),
+                "TRANSLATOR FAILURE | "
+                "RequestID=%s | "
+                "HTTPStatus=%s | "
+                "Response=%s",
                 request_id,
                 response.status_code,
                 response.text[:4000]
@@ -1338,97 +1635,74 @@ def text_trans_azure():
 
             try:
 
-                error_body = response.json()
+                error_body = (
+                    response.json()
+                )
 
             except ValueError:
 
                 error_body = {
-                    "message": response.text[:4000]
+                    "message":
+                        response.text[:4000]
                 }
 
             return jsonify({
-                "error": "Azure Translator request failed.",
-                "downstream_status": response.status_code,
-                "downstream_response": error_body,
-                "request_id": request_id
+                "error": (
+                    "Azure Translator "
+                    "request failed."
+                ),
+                "downstream_status":
+                    response.status_code,
+                "downstream_response":
+                    error_body,
+                "request_id":
+                    request_id
             }), response.status_code
 
-        # ----------------------------------------------------
-        # SUCCESS
-        # ----------------------------------------------------
-
-        response_json = response.json()
+        response_json = (
+            response.json()
+        )
 
         return jsonify(
             response_json
         ), 200
 
-    except requests.exceptions.Timeout as timeout_err:
-
-        logging.error(
-            (
-                "TRANSLATOR TIMEOUT | "
-                "RequestID=%s | "
-                "Error=%s"
-            ),
-            request_id,
-            str(timeout_err),
-            exc_info=True
-        )
+    except requests.exceptions.Timeout:
 
         return jsonify({
             "error": (
-                "Translation service request timed out."
-            )
+                "Translation service "
+                "request timed out."
+            ),
+            "request_id":
+                request_id
         }), 504
 
-    except requests.exceptions.HTTPError as http_err:
+    except requests.exceptions.RequestException as e:
 
         logging.error(
-            (
-                "HTTP error occurred | "
-                "RequestID=%s | "
-                "Error=%s"
-            ),
+            "Translator request error | "
+            "RequestID=%s | Error=%s",
             request_id,
-            str(http_err)
-        )
-
-        return jsonify({
-            "error": (
-                f"HTTP error occurred: "
-                f"{http_err}"
-            )
-        }), 500
-
-    except requests.exceptions.RequestException as req_err:
-
-        logging.error(
-            (
-                "Request error occurred | "
-                "RequestID=%s | "
-                "Error=%s"
-            ),
-            request_id,
-            str(req_err),
+            str(e),
             exc_info=True
         )
 
         return jsonify({
             "error": (
-                f"Request error occurred: "
-                f"{req_err}"
-            )
-        }), 500
+                "Translator request "
+                "could not be completed."
+            ),
+            "details": str(e),
+            "request_id":
+                request_id
+        }), 502
 
     except Exception as e:
 
         logging.error(
-            (
-                "Unexpected translation error | "
-                "RequestID=%s | "
-                "Error=%s"
-            ),
+            "Unexpected translation error | "
+            "RequestID=%s | Error=%s",
             request_id,
             str(e),
             exc_info=True
@@ -1438,7 +1712,10 @@ def text_trans_azure():
             "error": (
                 "An unexpected error occurred "
                 "while processing the translation."
-            )
+            ),
+            "details": str(e),
+            "request_id":
+                request_id
         }), 500
 
 
