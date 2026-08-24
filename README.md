@@ -1,1 +1,2 @@
-# alta-backend-qa
+# lang-trans-backend
+Language Translation Application Backe
