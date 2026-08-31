@@ -63,4 +63,4 @@ jobs:
         with:
           app-name: 'Devaiwebfunctions'
           slot-name: 'Production'
-          publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_3E0F418F86024B5794E97728F6C497E2 }}
+          publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_120C75D2D77342F582C1CE7C8DCF9E6B }}
